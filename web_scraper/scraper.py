@@ -1,279 +1,349 @@
+# web_scraper/scraper.py
+# Python 3.10+
+
 import os
-import re
+import logging
+from dataclasses import dataclass, asdict
+from datetime import datetime, date
 from time import time
-from requests import get
-from datetime import datetime
-from bs4 import BeautifulSoup
-from geopy import GoogleV3
+from typing import Optional, List, Dict, Tuple
+from urllib.parse import quote_plus
+import re
+
+import requests
+from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter, Retry
 from dotenv import load_dotenv
 
-from data.database import DataBase, StockingReport
+# project imports
+from data.database import DataBase
+from data.models import WaterLocation  # used for preloading the cache
 
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
+# ---------------- Model ------------------
+@dataclass
+class RowRecord:
+    original_html_name: Optional[str] = None
+    water_name_cleaned: Optional[str] = None
+    county: Optional[str] = None
+    region: Optional[str] = None
+    date: Optional[date] = None
+    species: Optional[str] = None
+    stocked_fish: Optional[int] = None
+    # DB column is "weight"; WDFW column is "Fish per pound"
+    weight: Optional[float] = None          # mapped from fish_per_lb
+    fish_per_lb: Optional[float] = None
+    approx_weight_lb: Optional[float] = None
+    hatchery: Optional[str] = None
+    notes: Optional[str] = None
+
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    directions: Optional[str] = None
+    derby_participant: bool = False
+
+# ---------- Legacy cleaning (matches your original) ----------
+ABBREVIATIONS = {
+    "LK": "Lake", "PD": "Pond", "CR": "Creek", "PRK": "Park", "CO": "County",
+    "ADLT": "Adult", "JV": "Juvenile"
+}
+
+_ABBR_REGEX = re.compile(
+    r"\(.*?\)|[^\w\s\d]|(?<!\w)(\d+)(?!\w)|\b(" + "|".join(ABBREVIATIONS.keys()) + r")\b"
+)
+
+def legacy_clean_water_name(cell_text: str) -> str:
+    raw = (cell_text or "").strip() + " County"
+
+    def _repl(m: re.Match) -> str:
+        if m.group(1):  # standalone numbers
+            return ""
+        if m.group(2):  # ABBR key
+            return ABBREVIATIONS.get(m.group(2), "")
+        return ""  # parens/punct -> drop
+
+    s = _ABBR_REGEX.sub(_repl, raw)
+    s = s.strip().replace("\n", "").replace(" Region ", "").replace("  ", " ")
+    s = s.title()
+    return s
+
+# ---------- Normalization for matching ----------
+_whitespace = re.compile(r"\s+")
+_nonword = re.compile(r"[^\w]+")
+
+def norm_key_exact(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    return s.strip()
+
+def norm_key_relaxed(s: Optional[str]) -> Optional[str]:
+    """Collapse whitespace & casefold; keep letters/digits/spaces."""
+    if not s:
+        return None
+    s2 = _whitespace.sub(" ", s).strip().casefold()
+    return s2
+
+def norm_key_alnum(s: Optional[str]) -> Optional[str]:
+    """Only letters/digits for last-resort match."""
+    if not s:
+        return None
+    s2 = _nonword.sub("", s).casefold()
+    return s2
+
+def parse_int(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+    try:
+        return int(text.replace(",", "").strip())
+    except Exception:
+        logging.debug("parse_int failed for %r", text)
+        return None
+
+def parse_float(text: Optional[str]) -> Optional[float]:
+    if not text:
+        return None
+    try:
+        return float(text.replace(",", "").strip())
+    except Exception:
+        logging.debug("parse_float failed for %r", text)
+        return None
+
+def parse_date_str(text: Optional[str]) -> Optional[date]:
+    if not text:
+        return None
+    s = text.strip()
+    for fmt in ("%b %d, %Y", "%b %e, %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    logging.warning("Unrecognized date: %r", text)
+    return None
+
+def build_maps_url(cleaned: Optional[str]) -> Optional[str]:
+    if not cleaned:
+        return None
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(cleaned + ' Washington State')}"
+
+# --------------- Scraper -----------------
 class Scraper:
-    """
-    ************************* Scrape data to render the map from *************************
+    DEFAULT_URL = (
+        "https://wdfw.wa.gov/fishing/reports/stocking/trout-plants/all"
+        "?lake_stocked=&county=&species=&hatchery=&region=&items_per_page=250"
+    )
 
-    Need: Lake names, stock count, date stocked, derby participant, and lat/lon
-    Steps:
-    1. Scrape the data from wdfw.wa.gov
-    2. Use Geolocator to get lat/lon
-    3. Make the data into a list of dictionaries
-    """
+    def __init__(self, db: Optional[DataBase] = None):
+        self.db = db
+        self.session = self._session()
+        # behavior flags
+        self.allow_create_wl = os.getenv("SCRAPER_ALLOW_CREATE_WATER_LOCATION", "false").lower() in ("1", "true", "yes")
+        self.do_geocode = os.getenv("SCRAPER_GEOCODE", "false").lower() in ("1", "true", "yes")
 
-    def __init__(self, request_url=""):
-        self.request_url = request_url
-        self.response = {}
-        self.soup = {}
-        self.df = []  # List[Dict[str, Any]]
+        # preload existing WaterLocation rows into multiple lookup maps
+        self._existing_maps_built = False
+        self.by_original_exact: Dict[str, WaterLocation] = {}
+        self.by_original_relaxed: Dict[str, WaterLocation] = {}
+        self.by_original_alnum: Dict[str, WaterLocation] = {}
+        self.by_clean_relaxed: Dict[str, WaterLocation] = {}
+        self.by_clean_alnum: Dict[str, WaterLocation] = {}
 
-    def set_scraper_config(self, url=""):
-        if not self.request_url:
-            self.request_url = url
-        self.response = get(self.request_url)
-        if self.response.status_code != 200:
-            print("Error fetching page")
-            exit()
-        self.soup = BeautifulSoup(self.response.content, "html.parser")
-
-    def scrape_water_locations_initialize_df(self):
-        found_text = self.soup.select('.views-field-lake-stocked')
-        # abbreviations found in html table in wdfw site
-        ABBREVIATIONS = {"LK": "Lake", "PD": "Pond",
-                         "CR": "Creek", "PRK": "Park", "CO": "County"}
-
-        # makes a tuple of (cleaned version, original version) from the abbreviations
-        text_list = [
-            (
-                re.sub(
-                    r"\(.*?\)|[^\w\s\d]|(?<!\w)(\d+)(?!\w)|\b(" +
-                    "|".join(ABBREVIATIONS.keys()) + r")\b",
-                    lambda m: "" if m.group(
-                        1) else ABBREVIATIONS.get(m.group(2), ""),
-                    i.text.strip() + " County"
-                ).strip().replace("\n", "").replace(" Region ", "").replace("  ", " ").title(),
-                i.text
-            )
-            for i in found_text
-        ][1:]
-        # Initialize df with placeholders
-        self.df = [
-            {
-                "water_name_cleaned": clean,
-                "original_html_name": orig,
-                "stocked_fish": None,
-                "date": None,
-                "species": None,
-                "weight": None,
-                "hatchery": None,
-                "latitude": None,
-                "longitude": None,
-                "directions": None,
-                "derby_participant": False
-            }
-            for clean, orig in text_list
-        ]
-
-    # return list of Stock Counts
-    def scrape_stock_count(self):
-        found_stock_counts = self.soup.findAll(
-            class_="views-field views-field-num-fish")
-
-        stock_count_text_list = [i.text.strip().replace(',', '')
-                                 for i in found_stock_counts]
-
-        stock_count_int_list = []
-        for i in stock_count_text_list:
-            try:
-                stock_count_int_list.append(int(i))
-            except ValueError:
-                stock_count_int_list.append(i)
-                print(f"Error: {i} is not a valid number")
-                continue
-
-        counts = stock_count_int_list[1:]
-        for i, cnt in enumerate(counts):
-            if i < len(self.df):
-                self.df[i]['stocked_fish'] = cnt
-
-    # return list of Species
-    def scrape_species(self):
-        found_text = self.soup.findAll(
-            class_="views-field views-field-species")
-
-        species_text_list = [i.text.strip() for i in found_text]
-
-        species_list = species_text_list[1:]
-        for i, sp in enumerate(species_list):
-            if i < len(self.df):
-                self.df[i]['species'] = sp
-
-    # return list of Weights
-    def scrape_weights(self):
-        found_text = self.soup.findAll(
-            class_="views-field views-field-fish-per-lb")
-
-        weights_float_list = []
-        for i in found_text:
-            try:
-                weight = float(i.text.strip())
-                weights_float_list.append(weight)
-            except ValueError:
-                # handle the error here, such as skipping the value or setting it to a default value
-                print(f"Could not convert {i.text.strip()} to float")
-        for i, w in enumerate(weights_float_list):
-            if i < len(self.df):
-                self.df[i]['weight'] = w
-
-    # return list of Weights
-    def scrape_hatcheries(self):
-        found_text = self.soup.findAll(
-            class_="views-field views-field-hatchery")
-
-        hatcheries_text_list = [i.text.strip().title() for i in found_text]
-
-        hatchery_list = hatcheries_text_list[1:]
-        for i, h in enumerate(hatchery_list):
-            if i < len(self.df):
-                self.df[i]['hatchery'] = h
-
-    # Return list of Scraped Dates
-    def scrape_date(self):
-        date_text = self.soup.findAll(
-            class_="views-field views-field-stock-date")
-
-        date_text_list = [i.text.strip() for i in date_text]
-
-        date_list = []
-        for i in date_text_list:
-            try:
-                date_list.append(datetime.strptime(i, '%b %d, %Y').date(
-                ) or datetime.strptime(i, '%b %dd, %Y').date())
-            except ValueError:
-                date_list.append(i)
-                print(f"Error: {i} is not a valid date")
-                continue
-
-        dates = date_list[1:]
-        for i, d in enumerate(dates):
-            if i < len(self.df):
-                self.df[i]['date'] = d
-
-    # Return a list of names of lakes that are in the state trout derby
-    # TODO: Update this. Not working at the moment. Will be a paid feature
-    def scrape_derby_names(self):
-
-        # The trout derby doesn't start until april 22. don't scrape names unless the derby is running
-        Trout_derby_start_date = datetime(2024, 4, 30)
-        today = datetime.now()
-        if today > Trout_derby_start_date:
-            url_string = "https://wdfw.wa.gov/fishing/contests/trout-derby/lakes"
-
-            # Reassign response and soup to new url
-            self.response = get(url_string)
-            self.soup = BeautifulSoup(self.response.content, "html.parser")
-
-            # Scrape Names
-            text_list = []
-            found_text = self.soup.find("div", {"class": "derby-lakes-list"})
-            if found_text:
-                found_text = found_text.findAll("ul", recursive=False)
-
-                for i in found_text:
-                    text_list.append(i.find("li").text)
-
-                # Clean up Names
-                text_lst_trimmed = []
-                for i in text_list:
-                    text_lst_trimmed.append(i.replace("\n", ""))
-                derby_list = [
-                    re.sub(r"\(.*?\)", '', text).title() for text in text_lst_trimmed]
-                for row in self.df:
-                    if row['lake'] in derby_list:
-                        row['derby_participant'] = True
-                # add to df to make it  {stocking_reports: [], derby_waters: []}
-            else:
-                print("No derby lake names")
-                return
-
-    def get_lat_lon(self):
-        locator = GoogleV3(api_key=os.getenv('GV3_API_KEY'))
-
-        for stock_report_object in self.df:
-            water_location = data_base.get_water_location(
-                stock_report_object['original_html_name']
-            )
-
-            if water_location:
-                print(
-                    f"Skipped In the scraper. water_location already added: {stock_report_object['original_html_name']} "
-                )
-                continue
-
-            # Geocode and update in place
-            geocode = locator.geocode(
-                stock_report_object["water_name_cleaned"] + " washington state"
-            )
-            if geocode:
-                print(f"Geocoding {stock_report_object['water_name_cleaned']}")
-                stock_report_object['latitude'] = float(geocode.point[0])
-                stock_report_object['longitude'] = float(geocode.point[1])
-            else:
-                stock_report_object['latitude'] = 0.0
-                stock_report_object['longitude'] = 0.0
-
-            stock_report_object['directions'] = (
-                f"https://www.google.com/maps/search/?api=1&query={stock_report_object['water_name_cleaned']}"
-            )
-
-    def run_all_scrapes(self):
-        self.scrape_water_locations_initialize_df()
-        self.scrape_stock_count()
-        self.scrape_date()
-        self.scrape_species()
-        self.scrape_weights()
-        self.scrape_hatcheries()
-        # self.scrape_derby_names()
-        self.get_lat_lon()
-        # print("DF AFTER SCRAPING: ", self.df)
-        return self.df
-
-
-def write_archived_data():
-    # ran only in a dev environment, used to get all the wdfw trout plant archives
-    # data_base = DataBase()
-    print("archiving....")
-    scraper = Scraper()
-    # for i in range(2015, 2024):  # data goes back to 2015
-    for j in range(8):  # there are at most 7 pages to scrape
-
-        # print("scraping....year {i}, page {j}")
-        scraper.set_scraper_config(
-            f"https://wdfw.wa.gov/fishing/reports/stocking/trout-plants/archive/2020?lake_stocked=&county=&species=&hatchery=&region=&items_per_page=250&page={j}"
-            # f'https://wdfw.wa.gov/fishing/reports/stocking/trout-plants/archive/{i}?lake_stocked=&county=&species=&hatchery=&region=&items_per_page=250&page={j}'
-            # f'https://wdfw.wa.gov/fishing/reports/stocking/trout-plants/all?lake_stocked=&county=&species=&hatchery=&region=&items_per_page=250&page={j}'
+    @staticmethod
+    def _session() -> requests.Session:
+        s = requests.Session()
+        s.headers["User-Agent"] = "TroutlyticsScraper/1.0 (+contact: troutlytics)"
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
         )
-        scraper.scrape_water_locations_initialize_df()
-        [data_base.insert_water_location(
-            original_html_name=lake_name[1], water_name_cleaned=lake_name[0], latitude=0.0, longitude=0.0, directions="", derby_participant=False) for lake_name in scraper.df]
-        # print(f'updated year {i}, page {j}')
+        s.mount("https://", HTTPAdapter(max_retries=retries))
+        s.mount("http://", HTTPAdapter(max_retries=retries))
+        return s
 
+    def _build_existing_maps(self):
+        if self._existing_maps_built or not self.db:
+            return
+        logging.info("Preloading existing WaterLocation index...")
+        q = self.db.session.query(WaterLocation).all()
+        for wl in q:
+            o = wl.original_html_name or ""
+            c = wl.water_name_cleaned or ""
 
-# Run Once Every day
-if __name__ == "__main__":
-    print("starting Processes for Troutlytics web scraper")
+            k1 = norm_key_exact(o)
+            k2 = norm_key_relaxed(o)
+            k3 = norm_key_alnum(o)
+            k4 = norm_key_relaxed(c)
+            k5 = norm_key_alnum(c)
+
+            if k1: self.by_original_exact.setdefault(k1, wl)
+            if k2: self.by_original_relaxed.setdefault(k2, wl)
+            if k3: self.by_original_alnum.setdefault(k3, wl)
+            if k4: self.by_clean_relaxed.setdefault(k4, wl)
+            if k5: self.by_clean_alnum.setdefault(k5, wl)
+
+        self._existing_maps_built = True
+        logging.info("Indexed %d WaterLocation rows", len(q))
+
+    def _find_existing_wl(self, original_html_name: Optional[str], cleaned: Optional[str]) -> Optional[WaterLocation]:
+        """Try multiple keys to hit existing WaterLocation and avoid duplicates."""
+        if not self._existing_maps_built:
+            self._build_existing_maps()
+
+        for key, mapping in (
+            (norm_key_exact(original_html_name), self.by_original_exact),
+            (norm_key_relaxed(original_html_name), self.by_original_relaxed),
+            (norm_key_alnum(original_html_name), self.by_original_alnum),
+            (norm_key_relaxed(cleaned), self.by_clean_relaxed),
+            (norm_key_alnum(cleaned), self.by_clean_alnum),
+        ):
+            if key and key in mapping:
+                return mapping[key]
+        return None
+
+    def fetch(self, url: str) -> BeautifulSoup:
+        logging.info("Fetching %s", url)
+        r = self.session.get(url, timeout=20)
+        r.raise_for_status()
+        return BeautifulSoup(r.content, "html.parser")
+
+    def _parse_row(self, tr: Tag) -> Optional[RowRecord]:
+        def txt(sel: str) -> Optional[str]:
+            el = tr.select_one(sel)
+            return (el.get_text(strip=True) if el else None) or None
+
+        lake_td = tr.select_one(".views-field-lake-stocked")
+        if not lake_td:
+            return None
+
+        first_a = lake_td.find("a")
+        original = first_a.get_text(strip=True) if first_a else lake_td.get_text(strip=True)
+
+        anchors = lake_td.find_all("a")
+        county = anchors[1].get_text(strip=True) if len(anchors) >= 2 else None
+        region = None
+        if len(anchors) >= 3:
+            reg_text = anchors[2].get_text(strip=True)  # "Region 4"
+            m = re.search(r"(\d+)$", reg_text)
+            region = m.group(1) if m else reg_text
+
+        lake_cell_text_raw = lake_td.get_text()  # raw (with newlines) for legacy behavior
+        cleaned = legacy_clean_water_name(lake_cell_text_raw)
+
+        date_str   = txt(".views-field-stock-date")
+        # inside your row parse
+        species_raw  = txt(".views-field-species")
+        species      = species_raw.title().strip() if species_raw else None
+        num_str    = txt(".views-field-num-fish")
+        fpl_str    = txt(".views-field-fish-per-lb")
+        hatchery_raw = txt(".views-field-hatchery")
+        hatchery = hatchery_raw.title() if hatchery_raw else None
+        notes      = txt(".views-field-other-notes")
+
+        stocked = parse_int(num_str)
+        fpl     = parse_float(fpl_str)
+        approx  = (1.0 / fpl) if (fpl and fpl > 0) else None
+
+        return RowRecord(
+            original_html_name = original,
+            water_name_cleaned = cleaned,
+            county = county,
+            region = region,
+            date = parse_date_str(date_str),
+            species = species,
+            stocked_fish = stocked,
+            weight = fpl,                 # DB "weight" = fish-per-lb
+            fish_per_lb = fpl,
+            approx_weight_lb = approx,
+            hatchery = hatchery,
+            notes = notes,
+            directions = build_maps_url(cleaned),
+        )
+
+    def _geocode_one(self, query: str) -> Tuple[Optional[float], Optional[float]]:
+        from geopy import GoogleV3
+        api_key = os.getenv("GV3_API_KEY")
+        if not api_key:
+            return (None, None)
+        locator = GoogleV3(api_key=api_key)
+        try:
+            place = locator.geocode(query, timeout=10)
+            if place and place.point:
+                return (float(place.point[0]), float(place.point[1]))
+        except Exception as e:
+            logging.warning("Geocode error for %s: %s", query, e)
+        return (None, None)
+
+    def scrape(self, url: Optional[str] = None) -> List[RowRecord]:
+        soup = self.fetch(url or self.DEFAULT_URL)
+        trs = soup.select("table.cols-7 tbody tr")
+        out: List[RowRecord] = []
+        for tr in trs:
+            rec = self._parse_row(tr)
+            if rec:
+                out.append(rec)
+        logging.info("Parsed %d rows", len(out))
+        return out
+
+# ------------- Main ----------------
+def main():
     load_dotenv()
-    start_time = time()
-    data_base = DataBase()
+    start = time()
+    db = DataBase()
+    scraper = Scraper(db=db)
 
-    scraper = Scraper(
-        request_url="https://wdfw.wa.gov/fishing/reports/stocking/trout-plants/all?lake_stocked=&county=&species=&hatchery=&region=&items_per_page=250")
-    scraper.set_scraper_config()
-    scraper.run_all_scrapes()
-    data_base.write_data(data=scraper.df)
+    rows = scraper.scrape()
 
-    # if os.getenv('ENVIRONMENT') and os.getenv('ENVIRONMENT') == 'testing':
-    #     data_base.back_up_database()
+    # Attach existing WaterLocation when possible; control creation via env
+    payload: List[Dict] = []
+    created_blocked = 0
+    matched_existing = 0
+    created_new = 0
 
-    end_time = time()
-    print(f"It took {end_time - start_time:.2f} seconds to compute")
+    for r in rows:
+        existing = scraper._find_existing_wl(r.original_html_name, r.water_name_cleaned)
+
+        if existing:
+            matched_existing += 1
+            r.latitude = float(existing.latitude) if existing.latitude is not None else None
+            r.longitude = float(existing.longitude) if existing.longitude is not None else None
+            r.directions = existing.directions or r.directions
+        else:
+            if scraper.allow_create_wl:
+                if scraper.do_geocode:
+                    q = r.directions.split("query=", 1)[-1] if r.directions else quote_plus((r.water_name_cleaned or "") + " Washington State")
+                    lat, lon = scraper._geocode_one(q)
+                    r.latitude, r.longitude = lat, lon
+                created_new += 1
+            else:
+                created_blocked += 1
+                continue  # skip to avoid creating phantom WLs
+
+        d = asdict(r)
+        payload.append({
+            "original_html_name": d["original_html_name"],
+            "water_name_cleaned": d["water_name_cleaned"],
+            "stocked_fish": d["stocked_fish"],
+            "date": d["date"],
+            "species": d["species"],
+            "weight": d["weight"],            # fish-per-lb
+            "hatchery": d["hatchery"],
+            "latitude": d["latitude"],
+            "longitude": d["longitude"],
+            "directions": d["directions"],
+            "derby_participant": d["derby_participant"],
+        })
+
+    logging.info("Matched existing WL: %d | New WL allowed: %d | New WL blocked: %d",
+                 matched_existing, created_new, created_blocked)
+
+    db.write_data(payload)
+    logging.info("Done in %.2fs", time() - start)
+
+if __name__ == "__main__":
+    main()

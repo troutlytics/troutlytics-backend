@@ -1,4 +1,4 @@
-which pytest# Trout Tracker WA Web Scraper
+# Trout Tracker WA Web Scraper
 
 ## Introduction
 
@@ -32,8 +32,8 @@ The Scraper folder houses the scripts responsible for scraping data from the WDF
 
 #### Or with Docker
 
-            docker-compose -f scraper.yaml build
-            docker-compose -f scraper.yaml up
+        docker compose -f 'docker-compose.yml' up -d --build 'web-scraper'
+        docker compose run --rm web-scraper
 
 ### Data Handling
 

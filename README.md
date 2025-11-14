@@ -1,14 +1,14 @@
-# 🐟 Troutlytics Backend
+# Troutlytics Backend
 
 [![Python application](https://github.com/troutlytics/troutlytics-backend/actions/workflows/python-app.yml/badge.svg)](https://github.com/troutlytics/troutlytics-backend/actions/workflows/python-app.yml)
 
 ## Description
 
-**Troutlytics** is a data-driven Python application that scrapes and stores trout stocking data for Washington State lakes. It runs on a scheduled AWS Fargate task and stores results in an Aurora PostgreSQL database for use in dashboards, maps, and analysis tools.
+This backend for **Troutlytics** is an ETL pipeline made with Python that scrapes and stores trout stocking data for Washington State lakes. It runs on a scheduled AWS Fargate task and stores results in an Aurora PostgreSQL database for use in dashboards, maps, and analysis tools.
 
 ---
 
-## 📦 Project Structure
+## Project Structure
 
 ```bash
 .
@@ -50,7 +50,7 @@
 
 ⸻
 
-🚀 Deployment Overview
+Deployment Overview
 
 AWS Infrastructure:
 
@@ -76,9 +76,9 @@ GitHub → ECR Workflow:
 
 ⸻
 
-🧪 Run Locally
+Run Locally
 
-## 🚀 Docker Compose Commands Cheat Sheet
+## Docker Compose Commands Cheat Sheet
 
 Everything is ran from the root repo folder
 
@@ -104,7 +104,7 @@ Everything is ran from the root repo folder
 
 ---
 
-## 🛠️ Cloud Setup
+## Cloud Setup
 
 Deploy the CloudFormation Stack:
 
@@ -123,7 +123,7 @@ aws cloudformation deploy \
 
 ⸻
 
-🔐 GitHub → ECR Deploy (CI/CD)
+GitHub → ECR Deploy (CI/CD)
 
 To enable GitHub Actions auto-deploy:
 
@@ -133,7 +133,7 @@ To enable GitHub Actions auto-deploy:
 
 ⸻
 
-📈 Roadmap Ideas
+Roadmap Ideas
 
 - Add support for weather/streamflow overlays
 - Enable historical trend analysis by lake
@@ -142,7 +142,7 @@ To enable GitHub Actions auto-deploy:
 
 ⸻
 
-🧠 Credits
+Credits
 
 Created by @thomas-basham — U.S. Army veteran, full-stack developer, and passionate angler 🎣
 
