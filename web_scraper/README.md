@@ -1,4 +1,4 @@
-# Trout Tracker WA Web Scraper
+# Troutlytics WA Web Scraper
 
 ## Introduction
 
@@ -31,6 +31,8 @@ The Scraper folder houses the scripts responsible for scraping data from the WDF
             python -m api.wsgi
 
 #### Or with Docker
+
+**web-scraper:**
 
         docker compose -f 'docker-compose.yml' up -d --build 'web-scraper'
         docker compose run --rm web-scraper
