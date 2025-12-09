@@ -2,6 +2,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from threading import Lock
+from typing import Any, Dict, Optional
 from data.database import DataBase
 from mangum import Mangum
 import uvicorn
@@ -14,6 +16,35 @@ logger = logging.getLogger()
 load_dotenv()
 db = DataBase()
 app = FastAPI()
+
+# Simple in-memory cache for expensive queries. This keeps a warmed result in
+# memory for a period to speed up first paint for new users.
+cache_lock = Lock()
+cached_all_time: Dict[str, Optional[Any]] = {"data": None, "fetched_at": None}
+CACHE_TTL_HOURS = 12
+
+
+def get_cached_all_time_stocked_lakes(force_refresh: bool = False):
+    now = datetime.now()
+
+    with cache_lock:
+        data = cached_all_time.get("data")
+        fetched_at = cached_all_time.get("fetched_at")
+        is_fresh = fetched_at and (now - fetched_at) < timedelta(hours=CACHE_TTL_HOURS)
+        if data is not None and is_fresh and not force_refresh:
+            return data
+
+    # Cache miss or stale; fetch and store.
+    start_date = datetime(2000, 1, 1)
+    end_date = now
+    stocked_lakes = db.get_stocked_lakes_data(end_date=end_date, start_date=start_date)
+
+    with cache_lock:
+        cached_all_time["data"] = stocked_lakes
+        cached_all_time["fetched_at"] = now
+
+    return stocked_lakes
+
 def parse_query_dates(request: Request):
     now = datetime.now()
     end_date_str = request.query_params.get("end_date")
@@ -49,6 +80,7 @@ async def index_view():
         "routes": {
             "/": "API Information",
             "/stocked_lakes_data": "Retrieve data for stocked lakes",
+            "/stocked_lakes_data_all_time": "Retrieve data for stocked lakes from 2000 to today",
             "/total_stocked_by_date_data": "Retrieve total number of fish stocked by date",
             "/hatchery_totals": "Retrieve hatchery totals",
             "/derby_lakes_data": "Retrieve derby lakes data",
@@ -62,6 +94,14 @@ async def index_view():
                     "end_date": "End date for data (optional, default: current date)"
                 },
                 "example": "/stocked_lakes_data?start_date=2023-01-01&end_date=2023-01-07"
+            },
+            "/stocked_lakes_data_all_time": {
+                "method": "GET",
+                "description": "Retrieve stocked lakes data from 2000-01-01 through today (cached ~12h)",
+                "params": {
+                    "refresh": "If true, bypass cache and refresh (optional, default: false)"
+                },
+                "example": "/stocked_lakes_data_all_time"
             },
             "/total_stocked_by_date_data": {
                 "method": "GET",
@@ -103,6 +143,15 @@ async def get_stocked_lakes_data(request: Request):
         return stocked_lakes
     except Exception as e:
         logger.exception("Failed to fetch stocked lakes data")
+        return {"error": str(e)}
+
+@app.get("/stocked_lakes_data_all_time")
+async def get_stocked_lakes_data_all_time(refresh: bool = False):
+    try:
+        stocked_lakes = get_cached_all_time_stocked_lakes(force_refresh=refresh)
+        return stocked_lakes
+    except Exception as e:
+        logger.exception("Failed to fetch all stocked lakes data")
         return {"error": str(e)}
 
 @app.get("/total_stocked_by_date_data")
