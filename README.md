@@ -1,112 +1,42 @@
 # Troutlytics Backend
 
-[![Python application](https://github.com/troutlytics/troutlytics-backend/actions/workflows/python-app.yml/badge.svg)](https://github.com/troutlytics/troutlytics-backend/actions/workflows/python-app.yml)
+Backend pipeline for Troutlytics. Scrapes Washington trout stocking data, cleans it, and stores it in PostgreSQL for use by dashboards, maps, and analysis tools. The scraper runs on a scheduled AWS Fargate task and the API is packaged for AWS Lambda or containerized hosting.
 
-## Description
-
-This backend for **Troutlytics** is an ETL pipeline made with Python that scrapes and stores trout stocking data for Washington State lakes. It runs on a scheduled AWS Fargate task and stores results in an Aurora PostgreSQL database for use in dashboards, maps, and analysis tools.
-
----
-
-## Project Structure
+## Repository Layout
 
 ```bash
 .
-├── api/                          # 🎯 Main application API
-│   ├── __init__.py              # API package initializer
-│   ├── index.py                 # API entrypoint (routes/controllers)
-│   ├── requirements.txt         # API dependencies
-│   ├── dockerfiles/
-│   │   ├── dev/Dockerfile       # Dev Dockerfile
-│   │   └── prod/                # Production Dockerfile (Lambda-ready)
-│   │       ├── Dockerfile
-│   │       └── lambda_entry_script.sh
-│   └── README.md                # API-specific usage docs
-
-├── web_scraper/                 # 🕸️ Web scraping service
-│   ├── __init__.py
-│   ├── scraper.py              # Main script for collecting trout/creel data
-│   ├── Dockerfile              # Docker setup for scraper
-│   ├── Makefile                # Shortcuts for common dev tasks
-│   ├── requirements.txt
-│   ├── README.md
-│   └── tests/                  # 🔬 Pytest-based tests
-│       ├── __init__.py
-│       └── test_scraper.py
-
-├── data/                        # 🗃️ Database models and storage
-│   ├── __init__.py
-│   ├── database.py             # SQLAlchemy engine and session config
-│   ├── models.py               # ORM models for tables
-│   ├── backup_data.sql         # SQL dump for backup or restore
-│   ├── backup_data.txt         # Raw text backup
-│   └── sqlite.db               # Local development database
-
-├── aws_config/                 # ☁️ AWS deployment and secrets setup
-│   ├── configure-aws-credentials-latest.yml  # GitHub Actions for AWS login
-│   └── fargate-rds-secrets.yaml              # Fargate setup with RDS and Secrets Manager served there)
-├── README.md              # You are here 📘
+├── api/              FastAPI service that serves stocking data (see api/README.md)
+├── web_scraper/      Scraper that pulls WDFW data and geocodes locations (see web_scraper/README.md)
+├── data/             SQLAlchemy models, local SQLite database, and backups
+├── aws_config/       CloudFormation templates for Fargate, RDS, and IAM
+├── docker-compose.yml
+└── Makefile
 ```
 
-⸻
+## Prerequisites
 
-Deployment Overview
+- AWS account with permissions to deploy CloudFormation, ECR, ECS/Fargate, and Secrets Manager
+- AWS CLI configured locally
+- Docker
+- Python 3.11+ (for local runs without containers)
 
-AWS Infrastructure:
+## Quick Start (Docker Compose)
 
-- Fargate runs the scraper every 24 hours via EventBridge.
-- Secrets Manager securely stores DB credentials.
-- Aurora PostgreSQL stores structured stocking data.
-- CloudWatch Logs tracks runtime output for visibility.
-- API hosted with API Gateway and Lambda
+From the repository root:
 
-GitHub → ECR Workflow:
+- Build all images: `docker compose build`
+- Start API and scraper: `docker compose up`
+- Run only the API (dev): `docker compose up api-dev`
+- Run only the scraper: `docker compose up web-scraper`
+- View logs: `docker compose logs -f`
+- Stop and clean up: `docker compose down`
 
-- Automatically builds and pushes Docker image on main branch updates.
-- Uses secure OIDC GitHub Actions role to push to ECR.
+Provide environment variables via a `.env` file in the project root; Docker Compose will pass them to each service.
 
-⸻
+## Cloud Deployment
 
-📋 Prerequisites
-
-- An AWS Account configured with appropriate permissions
-- AWS CLI configured with appropriate permissions
-- Docker installed (for local and prod builds)
-- Python 3.11+
-
-⸻
-
-Run Locally
-
-## Docker Compose Commands Cheat Sheet
-
-Everything is ran from the root repo folder
-
-| Action                       | Command                            | Notes                                         |
-| :--------------------------- | :--------------------------------- | :-------------------------------------------- |
-| **Build all services**       | `docker compose build`             | Build all images                              |
-| **Start all services**       | `docker compose up`                | Start API(s), Scraper                         |
-| **Start all + rebuild**      | `docker compose up --build`        | Force rebuild before starting                 |
-| **Start dev API only**       | `docker compose up api-dev`        | Starts API Dev service                        |
-| **Start prod API only**      | `docker compose up api-prod`       | Starts API Prod service                       |
-| **Start scraper only**       | `docker compose up web-scraper`    | Starts Scraper                                |
-| **Stop all services**        | `docker compose down`              | Stops and removes all containers and networks |
-| **Rebuild dev API only**     | `docker compose build api-dev`     | Rebuild only the dev API image                |
-| **Rebuild prod API only**    | `docker compose build api-prod`    | Rebuild only the prod API image               |
-| **Rebuild scraper only**     | `docker compose build web-scraper` | Rebuild only the scraper image                |
-| **View running containers**  | `docker compose ps`                | Show status of all services                   |
-| **View logs (all services)** | `docker compose logs`              | View logs for all services                    |
-| **Follow logs live**         | `docker compose logs -f`           | Stream logs in real time                      |
-| **Stop dev API**             | `docker compose stop api-dev`      | Stop only the dev API container               |
-| **Stop prod API**            | `docker compose stop api-prod`     | Stop only the prod API container              |
-| **Stop scraper**             | `docker compose stop web-scraper`  | Stop only the scraper container               |
-| **Restart all containers**   | `docker compose restart`           | Restart all running services                  |
-
----
-
-## Cloud Setup
-
-Deploy the CloudFormation Stack:
+Deploy core infrastructure with CloudFormation:
 
 ```bash
 aws cloudformation deploy \
@@ -121,33 +51,13 @@ aws cloudformation deploy \
     SecurityGroupId=sg-xxxxxxxx
 ```
 
-⸻
+Secrets Manager should store the database credentials used by the scraper and API. CloudWatch Logs is configured for both services.
 
-GitHub → ECR Deploy (CI/CD)
+## CI/CD
 
-To enable GitHub Actions auto-deploy:
+- GitHub Actions build and push container images to ECR on pushes to `main`.
+- OIDC-based IAM role is required for the GitHub workflow; supply the role ARN as a repository secret.
 
-1. Deploy the github_oidc_ecr_access.yaml CloudFormation template.
-2. Add the output IAM Role ARN to your GitHub Actions secrets or workflows.
-3. Push to main — your image builds and publishes to ECR automatically.
-
-⸻
-
-Roadmap Ideas
-
-- Add support for weather/streamflow overlays
-- Enable historical trend analysis by lake
-- Integrate public stocking alerts
-- Expand scraper coverage to other regions or species
-
-⸻
-
-Credits
-
-Created by @thomas-basham — U.S. Army veteran, full-stack developer, and passionate angler 🎣
-
-⸻
-
-License
+## License
 
 MIT

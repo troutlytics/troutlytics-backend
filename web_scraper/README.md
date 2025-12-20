@@ -1,55 +1,53 @@
 # Troutlytics WA Web Scraper
 
-## Introduction
+Scrapes trout stocking data from the WDFW site, geocodes locations, and prepares records for the API/database.
 
-The Scraper folder houses the scripts responsible for scraping data from the WDFW website and transforming it for use.
+## Requirements
 
-### Getting Started
+- Python 3.11+
+- Google Geocoding API key (for `GV3_API_KEY`)
+- `.env` file with required variables (see `sample.env`)
+- Docker (optional, for Compose)
 
-- Ensure the `./web_scraper` dependencies are installed.
-- Set up a `.env` file with the necessary API keys.
+## Setup
 
-### Features
+1. Copy `sample.env` to `.env` and fill in values.
+2. Install dependencies:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r web_scraper/requirements.txt
+   ```
 
-- Automated data scraping from the WDFW website.
-- Data transformation into a structured format.
-- API for sending data across multiple resources
-- Manual backups for extra durability
-- CI/CD testing with Pytest and GitHub actions
+## Run the Scraper
 
-### Running the web scraper
+From the repository root:
 
-- copy/paste the `sample.env` contents into a new file named `.env`
-- Get a [Google Geocoding API key](https://developers.google.com/maps/documentation/geolocation/overview)
-- Update the environmental variable `GV3_API_KEY` with your API Key
-- Then run:
+```bash
+python -m web_scraper.scraper
+```
 
-        python -m web_scraper.scraper
+With Docker Compose:
 
-- #### To run development server (Flask)
+```bash
+docker compose up web-scraper
+```
 
-            python -m api.wsgi
+Both options read configuration from `.env`.
 
-#### Or with Docker
+## Testing
 
-**web-scraper:**
+```bash
+cd web_scraper
+pytest
+```
 
-        docker compose -f 'docker-compose.yml' up -d --build 'web-scraper'
-        docker compose run --rm web-scraper
+## Notes
 
-### Data Handling
+- Output data is written to the shared database defined by your environment variables.
+- GitHub Actions run tests on pushes; keep tests updated with scraper changes.
 
-- Instructions on how the scraped data is processed and stored
-
-#### Contributions
-
-- [Guidelines for improving the scraper's functionality](../CONTRIBUTING.md).
-
-#### License
-
-- MIT License
-
-#### Contact
+## Contact
 
 - Developer: Thomas Basham
 - Email: bashamtg@gmail.com
