@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -8,6 +9,7 @@ from data.database import DataBase
 from mangum import Mangum
 import uvicorn
 import logging
+import hashlib
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
@@ -22,6 +24,33 @@ app = FastAPI()
 cache_lock = Lock()
 cached_all_time: Dict[str, Optional[Any]] = {"data": None, "fetched_at": None}
 CACHE_TTL_HOURS = 12
+DEFAULT_CACHE_TTL_SECONDS = 300
+
+
+def build_etag(seed: str) -> str:
+    digest = hashlib.sha256(seed.encode()).hexdigest()
+    return f'W/"{digest}"'
+
+
+def cached_json_response(
+    payload: Any,
+    cache_seconds: int,
+    etag_seed: Optional[str] = None,
+    request: Optional[Request] = None,
+):
+    etag_value = build_etag(etag_seed) if etag_seed else None
+    headers = {
+        "Cache-Control": f"public, max-age={cache_seconds}, s-maxage={cache_seconds}",
+    }
+    if etag_value:
+        headers["ETag"] = etag_value
+
+    if etag_value and request:
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match and if_none_match == etag_value:
+            return Response(status_code=304, headers=headers)
+
+    return JSONResponse(content=payload, headers=headers)
 
 
 def get_cached_all_time_stocked_lakes(force_refresh: bool = False):
@@ -74,7 +103,7 @@ app.add_middleware(
 
 
 @app.get("/")
-async def index_view():
+async def index_view(request: Request):
     api_info = {
         "message": "Welcome to the TroutTracker WA API",
         "routes": {
@@ -131,7 +160,12 @@ async def index_view():
             }
         }
     }
-    return api_info
+    return cached_json_response(
+        api_info,
+        cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+        etag_seed="index",
+        request=request,
+    )
 
 
 @app.get("/stocked_lakes_data")
@@ -140,16 +174,30 @@ async def get_stocked_lakes_data(request: Request):
         start_date, end_date = parse_query_dates(request)
         stocked_lakes = db.get_stocked_lakes_data(
             end_date=end_date, start_date=start_date)
-        return stocked_lakes
+        last_updated = str(db.get_date_data_updated())
+        etag_seed = f"stocked:{start_date.isoformat()}:{end_date.isoformat()}:{last_updated}"
+        return cached_json_response(
+            stocked_lakes,
+            cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+            etag_seed=etag_seed,
+            request=request,
+        )
     except Exception as e:
         logger.exception("Failed to fetch stocked lakes data")
         return {"error": str(e)}
 
 @app.get("/stocked_lakes_data_all_time")
-async def get_stocked_lakes_data_all_time(refresh: bool = False):
+async def get_stocked_lakes_data_all_time(request: Request, refresh: bool = False):
     try:
         stocked_lakes = get_cached_all_time_stocked_lakes(force_refresh=refresh)
-        return stocked_lakes
+        last_updated = str(db.get_date_data_updated())
+        etag_seed = f"stocked-all-time:{last_updated}"
+        return cached_json_response(
+            stocked_lakes,
+            cache_seconds=CACHE_TTL_HOURS * 3600,
+            etag_seed=etag_seed,
+            request=request,
+        )
     except Exception as e:
         logger.exception("Failed to fetch all stocked lakes data")
         return {"error": str(e)}
@@ -164,7 +212,14 @@ async def get_total_stocked_by_date_data(request: Request):
         total_stocked_by_date = [{"date": str(date), "stocked_fish": stocked_fish}
                                 for date, stocked_fish in total_stocked_by_date]
 
-        return total_stocked_by_date
+        last_updated = str(db.get_date_data_updated())
+        etag_seed = f"total-by-date:{start_date.isoformat()}:{end_date.isoformat()}:{last_updated}"
+        return cached_json_response(
+            total_stocked_by_date,
+            cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+            etag_seed=etag_seed,
+            request=request,
+        )
 
 
 @app.get("/hatchery_totals")
@@ -175,27 +230,45 @@ async def get_hatchery_totals(request: Request):
             start_date=start_date, end_date=end_date)
         hatchery_totals = [{'hatchery': row[0], 'sum_1': row[1]}
                         for row in hatchery_totals]
-        return hatchery_totals
+        last_updated = str(db.get_date_data_updated())
+        etag_seed = f"hatchery-totals:{start_date.isoformat()}:{end_date.isoformat()}:{last_updated}"
+        return cached_json_response(
+            hatchery_totals,
+            cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+            etag_seed=etag_seed,
+            request=request,
+        )
 
 
 @app.get("/derby_lakes_data")
 async def get_derby_lakes_data():
     derby_lakes = db.get_derby_lakes_data()
     derby_lakes = [dict(row) for row in derby_lakes]
-    return derby_lakes
+    return cached_json_response(
+        derby_lakes,
+        cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+    )
 
 
 @app.get("/date_data_updated")
 async def get_date_data_updated():
     last_updated = db.get_date_data_updated()
     last_updated = str(last_updated)
-    return last_updated
+    return cached_json_response(
+        last_updated,
+        cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+        etag_seed=f"last-updated:{last_updated}",
+    )
 
 
 @app.get("/hatchery_names")
 async def get_unique_hatcheries():
     unique_hatcheries = db.get_unique_hatcheries()
-    return unique_hatcheries
+    return cached_json_response(
+        unique_hatcheries,
+        cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+        etag_seed="hatchery-names",
+    )
 
 
 handler = Mangum(app) 
