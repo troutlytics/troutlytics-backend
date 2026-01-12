@@ -1,4 +1,4 @@
-name: Deploy Scraper and API to AWS
+name: Build and Push Scraper and API Images
 
 on:
   push:
@@ -69,55 +69,3 @@ jobs:
           tags: |
             ${{ steps.api-image.outputs.ecr_image_uri }}
             ${{ steps.api-image.outputs.ecr_image_latest }}
-
-      - name: Deploy CloudFormation stack
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
-          STACK_NAME: ${{ secrets.SCRAPER_STACK_NAME }}
-          VPC_ID: ${{ secrets.SCRAPER_VPC_ID }}
-          SUBNET_IDS: ${{ secrets.SCRAPER_SUBNET_IDS }}
-          SECURITY_GROUP_ID: ${{ secrets.SCRAPER_SECURITY_GROUP_ID }}
-          SECRET_ARN: ${{ secrets.SCRAPER_SECRET_ARN }}
-          SCHEDULE_EXPRESSION: ${{ secrets.SCRAPER_SCHEDULE_EXPRESSION }}
-          USE_FARGATE_SPOT: ${{ secrets.SCRAPER_USE_FARGATE_SPOT }}
-          ASSIGN_PUBLIC_IP: ${{ secrets.SCRAPER_ASSIGN_PUBLIC_IP }}
-          ECR_IMAGE_URI: ${{ steps.scraper-image.outputs.ecr_image_uri }}
-        run: |
-          set -euo pipefail
-          AWS_REGION="${AWS_REGION:-us-west-2}"
-          STACK_NAME="${STACK_NAME:-troutlytics-scraper-schedule}"
-          SCHEDULE_EXPRESSION="${SCHEDULE_EXPRESSION:-rate(20 minutes)}"
-          USE_FARGATE_SPOT="${USE_FARGATE_SPOT:-true}"
-          ASSIGN_PUBLIC_IP="${ASSIGN_PUBLIC_IP:-ENABLED}"
-
-          aws cloudformation deploy \
-            --stack-name "$STACK_NAME" \
-            --template-file aws_config/scheduled-scraper-fargate.yaml \
-            --capabilities CAPABILITY_NAMED_IAM \
-            --region "$AWS_REGION" \
-            --parameter-overrides \
-              ECRImageUri="$ECR_IMAGE_URI" \
-              VpcId="$VPC_ID" \
-              SubnetIds="$SUBNET_IDS" \
-              SecurityGroupId="$SECURITY_GROUP_ID" \
-              SecretArn="$SECRET_ARN" \
-              ScheduleExpression="$SCHEDULE_EXPRESSION" \
-              UseFargateSpot="$USE_FARGATE_SPOT" \
-              AssignPublicIp="$ASSIGN_PUBLIC_IP"
-
-      - name: Update API Lambda image
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
-          API_LAMBDA_NAME: ${{ secrets.API_LAMBDA_NAME }}
-          API_IMAGE_URI: ${{ steps.api-image.outputs.ecr_image_uri }}
-        run: |
-          set -euo pipefail
-          if [ -z "${API_LAMBDA_NAME:-}" ]; then
-            echo "API_LAMBDA_NAME is not set; skipping Lambda update."
-            exit 0
-          fi
-
-          aws lambda update-function-code \
-            --function-name "$API_LAMBDA_NAME" \
-            --image-uri "$API_IMAGE_URI" \
-            --region "$AWS_REGION"
