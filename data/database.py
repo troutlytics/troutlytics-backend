@@ -128,14 +128,14 @@ class DataBase:
         )
 
     # -------- Write entry points --------
-    def write_data(self, data):
+    def write_data(self, data, utility_meta=None):
         # For SQLite demo runs, rebuild
         if str(self.engine) == "Engine(sqlite:///data/sqlite.db)":
             Base.metadata.drop_all(self.engine)
             Base.metadata.create_all(self.engine)
 
         self.write_lake_data(data)
-        self.write_utility_data()
+        self.write_utility_data(utility_meta=utility_meta)
         self.session.commit()
         self.session.close()
 
@@ -268,5 +268,29 @@ class DataBase:
 
         print(f'There were {self.insert_counter} entries added to {str(StockingReport.__tablename__)}')
 
-    def write_utility_data(self):
-        self.session.add(Utility(updated=datetime.now().astimezone().date()))
+    def write_utility_data(self, utility_meta=None):
+        utility_meta = utility_meta or {}
+        run_started_at = utility_meta.get("run_started_at")
+        run_finished_at = utility_meta.get("run_finished_at") or datetime.now().astimezone()
+        run_seconds = utility_meta.get("run_seconds")
+        if run_seconds is None and run_started_at:
+            run_seconds = (run_finished_at - run_started_at).total_seconds()
+
+        self.session.add(
+            Utility(
+                updated=run_finished_at.date(),
+                updated_at=run_finished_at,
+                run_started_at=run_started_at,
+                run_finished_at=run_finished_at,
+                run_seconds=run_seconds,
+                rows_scraped=utility_meta.get("rows_scraped"),
+                rows_payload=utility_meta.get("rows_payload"),
+                rows_inserted=utility_meta.get("rows_inserted", self.insert_counter),
+                water_locations_matched=utility_meta.get("water_locations_matched"),
+                water_locations_created=utility_meta.get("water_locations_created"),
+                water_locations_blocked=utility_meta.get("water_locations_blocked"),
+                source_url=utility_meta.get("source_url"),
+                scraper_version=utility_meta.get("scraper_version"),
+                status=utility_meta.get("status", "success"),
+            )
+        )

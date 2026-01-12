@@ -293,6 +293,7 @@ class Scraper:
 # ------------- Main ----------------
 def main():
     load_dotenv()
+    run_started_at = datetime.now().astimezone()
     start = time()
     db = DataBase()
     scraper = Scraper(db=db)
@@ -342,7 +343,26 @@ def main():
     logging.info("Matched existing WL: %d | New WL allowed: %d | New WL blocked: %d",
                  matched_existing, created_new, created_blocked)
 
-    db.write_data(payload)
+    scraper_version = (
+        os.getenv("SCRAPER_VERSION")
+        or os.getenv("GITHUB_SHA")
+        or os.getenv("IMAGE_TAG")
+        or os.getenv("GIT_SHA")
+    )
+    db.write_data(
+        payload,
+        utility_meta={
+            "run_started_at": run_started_at,
+            "rows_scraped": len(rows),
+            "rows_payload": len(payload),
+            "water_locations_matched": matched_existing,
+            "water_locations_created": created_new,
+            "water_locations_blocked": created_blocked,
+            "source_url": scraper.DEFAULT_URL,
+            "scraper_version": scraper_version,
+            "status": "success",
+        },
+    )
     logging.info("Done in %.2fs", time() - start)
 
 if __name__ == "__main__":
