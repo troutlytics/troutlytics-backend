@@ -1,5 +1,5 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Fargate task that runs a Docker scraper every 10 minutes using Secrets Manager for RDS credentials
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cost-effective scheduled Fargate task for the scraper using Secrets Manager for Postgres credentials
 
 Parameters:
   ECRImageUri:
@@ -12,7 +12,7 @@ Parameters:
 
   SubnetIds:
     Type: CommaDelimitedList
-    Description: Comma-separated list of private subnet IDs
+    Description: Comma-separated list of subnet IDs (public subnets recommended to avoid NAT costs)
 
   SecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
@@ -20,18 +20,78 @@ Parameters:
 
   SecretArn:
     Type: String
-    Description: ARN of the Secrets Manager secret with RDS credentials
+    Description: ARN of the Secrets Manager secret with Postgres credentials
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(20 minutes)
+    Description: EventBridge schedule expression (e.g. rate(24 hours) or cron(0 8 * * ? *))
+
+  Cpu:
+    Type: Number
+    Default: 256
+    Description: Fargate CPU units
+
+  Memory:
+    Type: Number
+    Default: 512
+    Description: Fargate memory (MiB)
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Assign a public IP (ENABLED for public subnets, DISABLED for private subnets)
+
+  UseFargateSpot:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Use Fargate Spot capacity for lower cost (may be interrupted)
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    Description: CloudWatch log retention in days
+
+Conditions:
+  UseSpot: !Equals [!Ref UseFargateSpot, "true"]
 
 Resources:
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: ScheduledScraperCluster
+      ClusterName: !Sub ${AWS::StackName}-cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
 
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: ScraperTaskExecutionRole
+      RoleName: !Sub ${AWS::StackName}-scraper-task-exec
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -54,15 +114,15 @@ Resources:
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/scraper
-      RetentionInDays: 7
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: !Ref LogRetentionDays
 
   ScraperTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: ScraperTask
-      Cpu: 256
-      Memory: 512
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
@@ -73,25 +133,25 @@ Resources:
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: /ecs/scraper
+              awslogs-group: !Sub /ecs/${AWS::StackName}
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: scraper
           Secrets:
-            - Name: DB_USERNAME
+            - Name: POSTGRES_USER
               ValueFrom: !Sub "${SecretArn}:username::"
-            - Name: DB_PASSWORD
+            - Name: POSTGRES_PASSWORD
               ValueFrom: !Sub "${SecretArn}:password::"
-            - Name: DB_HOST
+            - Name: POSTGRES_HOST
               ValueFrom: !Sub "${SecretArn}:host::"
-            - Name: DB_PORT
+            - Name: POSTGRES_PORT
               ValueFrom: !Sub "${SecretArn}:port::"
-            - Name: DB_NAME
+            - Name: POSTGRES_DB
               ValueFrom: !Sub "${SecretArn}:dbname::"
 
   EventsInvokeRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: EventsInvokeECSTask
+      RoleName: !Sub ${AWS::StackName}-events-invoke-ecs-task
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -107,14 +167,21 @@ Resources:
               - Effect: Allow
                 Action:
                   - ecs:RunTask
+                Resource: !Ref ScraperTaskDefinition
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt ECSCluster.Arn
+              - Effect: Allow
+                Action:
                   - iam:PassRole
-                Resource: "*"
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
 
   ScraperScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: RunScraperEvery24Hours
-      ScheduleExpression: rate(24 hours)
+      Name: !Sub ${AWS::StackName}-schedule
+      ScheduleExpression: !Ref ScheduleExpression
       State: ENABLED
       Targets:
         - Id: ScraperTarget
@@ -122,19 +189,24 @@ Resources:
           RoleArn: !GetAtt EventsInvokeRole.Arn
           EcsParameters:
             TaskDefinitionArn: !Ref ScraperTaskDefinition
-            LaunchType: FARGATE
             PlatformVersion: LATEST
             NetworkConfiguration:
               AwsVpcConfiguration:
                 Subnets: !Ref SubnetIds
                 SecurityGroups:
                   - !Ref SecurityGroupId
-                AssignPublicIp: ENABLED
+                AssignPublicIp: !Ref AssignPublicIp
+            LaunchType: !If [UseSpot, !Ref "AWS::NoValue", FARGATE]
+            CapacityProviderStrategy: !If
+              - UseSpot
+              - - CapacityProvider: FARGATE_SPOT
+                  Weight: 1
+              - !Ref "AWS::NoValue"
 
 Outputs:
   TaskDefinitionArn:
     Value: !Ref ScraperTaskDefinition
   LogGroupName:
-    Value: /ecs/scraper
-  Schedule:
-    Value: rate(20 minutes)
+    Value: !Sub /ecs/${AWS::StackName}
+  ScheduleExpression:
+    Value: !Ref ScheduleExpression
