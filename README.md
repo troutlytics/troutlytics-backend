@@ -38,6 +38,7 @@ Provide environment variables via a `.env` file in the project root; Docker Comp
 
 Deploy core infrastructure with CloudFormation:
 
+
 ```bash
 aws cloudformation deploy \
   --template-file aws_config/configure-aws-credentials-latest.yml \
