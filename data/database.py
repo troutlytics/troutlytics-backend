@@ -1,10 +1,11 @@
 # data/database.py
 
 import os
-from datetime import datetime, timedelta
-from typing import Optional, Set, Tuple
+from datetime import datetime, timedelta, date as dt_date
+from statistics import median
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import create_engine, exists, text
+from sqlalchemy import create_engine, exists, func, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -115,6 +116,377 @@ class DataBase:
     def get_unique_hatcheries(self):
         rows = self.conn.execute(text("SELECT DISTINCT hatchery FROM stocking_report ORDER BY hatchery")).fetchall()
         return [row[0] for row in rows]
+
+    def get_hatchery_profile(self, hatchery_name: str, recent_limit: int = 10):
+        query = (hatchery_name or "").strip()
+        if not query:
+            return {
+                "query": hatchery_name,
+                "resolved_hatchery": None,
+                "match_strategy": "none",
+                "match_count": 0,
+                "matches": [],
+                "summary": None,
+                "top_waters": [],
+                "species_breakdown": [],
+                "yearly_totals": [],
+                "monthly_totals": [],
+                "recent_stocking_activity": [],
+                "all_stocking_activity": [],
+                "geo_bounds": None,
+            }
+
+        pattern = f"%{query.lower()}%"
+        candidate_rows = (
+            self.session.query(
+                StockingReport.hatchery.label("hatchery"),
+                func.count(StockingReport.id).label("stocking_events"),
+                func.coalesce(func.sum(StockingReport.stocked_fish), 0).label("total_fish_stocked"),
+            )
+            .filter(StockingReport.hatchery.isnot(None))
+            .filter(func.lower(StockingReport.hatchery).like(pattern))
+            .group_by(StockingReport.hatchery)
+            .order_by(
+                func.coalesce(func.sum(StockingReport.stocked_fish), 0).desc(),
+                func.count(StockingReport.id).desc(),
+                StockingReport.hatchery.asc(),
+            )
+            .all()
+        )
+
+        matches = [
+            {
+                "hatchery": row.hatchery,
+                "stocking_events": int(row.stocking_events or 0),
+                "total_fish_stocked": int(row.total_fish_stocked or 0),
+            }
+            for row in candidate_rows
+        ]
+
+        if not matches:
+            return {
+                "query": query,
+                "resolved_hatchery": None,
+                "match_strategy": "none",
+                "match_count": 0,
+                "matches": [],
+                "summary": None,
+                "top_waters": [],
+                "species_breakdown": [],
+                "yearly_totals": [],
+                "monthly_totals": [],
+                "recent_stocking_activity": [],
+                "all_stocking_activity": [],
+                "geo_bounds": None,
+            }
+
+        exact_match = next((m for m in matches if (m["hatchery"] or "").lower() == query.lower()), None)
+        resolved_hatchery = exact_match["hatchery"] if exact_match else matches[0]["hatchery"]
+        match_strategy = "exact_case_insensitive" if exact_match else "best_partial_by_total_fish"
+
+        rows = (
+            self.session.query(WaterLocation, StockingReport)
+            .join(StockingReport, StockingReport.water_location_id == WaterLocation.id)
+            .filter(func.lower(StockingReport.hatchery) == resolved_hatchery.lower())
+            .order_by(StockingReport.date.desc(), StockingReport.id.desc())
+            .all()
+        )
+
+        def _coerce_date(v):
+            if v is None:
+                return None
+            if isinstance(v, datetime):
+                return v.date()
+            if isinstance(v, dt_date):
+                return v
+            if isinstance(v, str):
+                try:
+                    return datetime.strptime(v, "%Y-%m-%d").date()
+                except ValueError:
+                    return None
+            return None
+
+        def _iso(v):
+            d = _coerce_date(v)
+            return d.isoformat() if d else None
+
+        def _safe_round(v: Optional[float], digits: int = 2):
+            if v is None:
+                return None
+            return round(float(v), digits)
+
+        total_fish_stocked = 0
+        stocking_events = 0
+        unique_waters = set()
+        unique_species = set()
+        fish_counts: List[int] = []
+        weights: List[float] = []
+        dates: List[dt_date] = []
+        derby_stocking_events = 0
+        unique_waters_with_coordinates = set()
+        unique_derby_waters = set()
+
+        water_totals: Dict[str, Dict[str, Any]] = {}
+        species_totals: Dict[str, Dict[str, Any]] = {}
+        yearly_totals: Dict[int, Dict[str, Any]] = {}
+        monthly_totals: Dict[int, Dict[str, Any]] = {}
+        all_stocking_activity: List[Dict[str, Any]] = []
+
+        coordinate_points = set()
+
+        for water_loc, stocked in rows:
+            fish_stocked = int(stocked.stocked_fish or 0)
+            stocking_events += 1
+            total_fish_stocked += fish_stocked
+            fish_counts.append(fish_stocked)
+
+            event_date = _coerce_date(stocked.date)
+            if event_date:
+                dates.append(event_date)
+
+            weight_value = float(stocked.weight) if stocked.weight is not None else None
+            if weight_value is not None:
+                weights.append(weight_value)
+
+            water_name = water_loc.water_name_cleaned or "Unknown Water"
+            species_name = stocked.species or "Unknown Species"
+            unique_waters.add(water_name)
+            unique_species.add(species_name)
+
+            if water_loc.derby_participant:
+                derby_stocking_events += 1
+                unique_derby_waters.add(water_name)
+
+            if water_loc.latitude is not None and water_loc.longitude is not None:
+                lat = float(water_loc.latitude)
+                lon = float(water_loc.longitude)
+                coordinate_points.add((lat, lon))
+                unique_waters_with_coordinates.add(water_name)
+
+            event_record = {
+                "date": _iso(stocked.date),
+                "water_name": water_name,
+                "species": species_name,
+                "fish_stocked": fish_stocked,
+                "weight": weight_value,
+                "latitude": water_loc.latitude,
+                "longitude": water_loc.longitude,
+                "directions": water_loc.directions,
+                "derby_participant": bool(water_loc.derby_participant),
+            }
+            all_stocking_activity.append(event_record)
+
+            water_entry = water_totals.setdefault(
+                water_name,
+                {
+                    "water_name": water_name,
+                    "total_fish_stocked": 0,
+                    "stocking_events": 0,
+                    "first_stocking_date": None,
+                    "most_recent_stocking_date": None,
+                    "latitude": water_loc.latitude,
+                    "longitude": water_loc.longitude,
+                    "directions": water_loc.directions,
+                    "derby_participant": bool(water_loc.derby_participant),
+                    "species_set": set(),
+                },
+            )
+            water_entry["total_fish_stocked"] += fish_stocked
+            water_entry["stocking_events"] += 1
+            water_entry["species_set"].add(species_name)
+
+            if event_date:
+                if not water_entry["first_stocking_date"] or event_date < water_entry["first_stocking_date"]:
+                    water_entry["first_stocking_date"] = event_date
+                if not water_entry["most_recent_stocking_date"] or event_date > water_entry["most_recent_stocking_date"]:
+                    water_entry["most_recent_stocking_date"] = event_date
+
+            species_entry = species_totals.setdefault(
+                species_name,
+                {
+                    "species": species_name,
+                    "total_fish_stocked": 0,
+                    "stocking_events": 0,
+                    "weights": [],
+                },
+            )
+            species_entry["total_fish_stocked"] += fish_stocked
+            species_entry["stocking_events"] += 1
+            if weight_value is not None:
+                species_entry["weights"].append(weight_value)
+
+            if event_date:
+                year_entry = yearly_totals.setdefault(
+                    event_date.year,
+                    {
+                        "year": event_date.year,
+                        "total_fish_stocked": 0,
+                        "stocking_events": 0,
+                        "waters_set": set(),
+                        "species_set": set(),
+                    },
+                )
+                year_entry["total_fish_stocked"] += fish_stocked
+                year_entry["stocking_events"] += 1
+                year_entry["waters_set"].add(water_name)
+                year_entry["species_set"].add(species_name)
+
+                month_entry = monthly_totals.setdefault(
+                    event_date.month,
+                    {
+                        "month_number": event_date.month,
+                        "month": event_date.strftime("%b"),
+                        "total_fish_stocked": 0,
+                        "stocking_events": 0,
+                    },
+                )
+                month_entry["total_fish_stocked"] += fish_stocked
+                month_entry["stocking_events"] += 1
+
+        if coordinate_points:
+            latitudes = [point[0] for point in coordinate_points]
+            longitudes = [point[1] for point in coordinate_points]
+            geo_bounds = {
+                "min_latitude": min(latitudes),
+                "max_latitude": max(latitudes),
+                "min_longitude": min(longitudes),
+                "max_longitude": max(longitudes),
+                "center_latitude": _safe_round(sum(latitudes) / len(latitudes), 6),
+                "center_longitude": _safe_round(sum(longitudes) / len(longitudes), 6),
+            }
+        else:
+            geo_bounds = None
+
+        average_weight = (sum(weights) / len(weights)) if weights else None
+        average_fish_per_event = (total_fish_stocked / stocking_events) if stocking_events else None
+        median_fish_per_event = median(fish_counts) if fish_counts else None
+        first_recorded_stocking = min(dates).isoformat() if dates else None
+        most_recent_stocking = max(dates).isoformat() if dates else None
+        active_years = len({d.year for d in dates}) if dates else 0
+
+        top_waters = []
+        for data in water_totals.values():
+            top_waters.append(
+                {
+                    "water_name": data["water_name"],
+                    "total_fish_stocked": data["total_fish_stocked"],
+                    "stocking_events": data["stocking_events"],
+                    "first_stocking_date": data["first_stocking_date"].isoformat() if data["first_stocking_date"] else None,
+                    "most_recent_stocking_date": data["most_recent_stocking_date"].isoformat() if data["most_recent_stocking_date"] else None,
+                    "species": sorted(data["species_set"]),
+                    "latitude": data["latitude"],
+                    "longitude": data["longitude"],
+                    "directions": data["directions"],
+                    "derby_participant": data["derby_participant"],
+                    "share_of_total_fish_pct": _safe_round(
+                        (data["total_fish_stocked"] / total_fish_stocked) * 100 if total_fish_stocked else 0,
+                        2,
+                    ),
+                }
+            )
+        top_waters.sort(
+            key=lambda x: (-x["total_fish_stocked"], -x["stocking_events"], x["water_name"])
+        )
+
+        species_breakdown = []
+        for data in species_totals.values():
+            species_breakdown.append(
+                {
+                    "species": data["species"],
+                    "total_fish_stocked": data["total_fish_stocked"],
+                    "stocking_events": data["stocking_events"],
+                    "average_weight": _safe_round(
+                        sum(data["weights"]) / len(data["weights"]) if data["weights"] else None,
+                        2,
+                    ),
+                    "share_of_total_fish_pct": _safe_round(
+                        (data["total_fish_stocked"] / total_fish_stocked) * 100 if total_fish_stocked else 0,
+                        2,
+                    ),
+                }
+            )
+        species_breakdown.sort(
+            key=lambda x: (-x["total_fish_stocked"], -x["stocking_events"], x["species"])
+        )
+
+        yearly_summary = []
+        for year in sorted(yearly_totals.keys()):
+            data = yearly_totals[year]
+            yearly_summary.append(
+                {
+                    "year": data["year"],
+                    "total_fish_stocked": data["total_fish_stocked"],
+                    "stocking_events": data["stocking_events"],
+                    "unique_waters_served": len(data["waters_set"]),
+                    "unique_species_stocked": len(data["species_set"]),
+                    "average_fish_per_event": _safe_round(
+                        data["total_fish_stocked"] / data["stocking_events"] if data["stocking_events"] else None,
+                        2,
+                    ),
+                }
+            )
+
+        monthly_summary = []
+        for month in sorted(monthly_totals.keys()):
+            data = monthly_totals[month]
+            monthly_summary.append(
+                {
+                    "month_number": data["month_number"],
+                    "month": data["month"],
+                    "total_fish_stocked": data["total_fish_stocked"],
+                    "stocking_events": data["stocking_events"],
+                    "average_fish_per_event": _safe_round(
+                        data["total_fish_stocked"] / data["stocking_events"] if data["stocking_events"] else None,
+                        2,
+                    ),
+                }
+            )
+
+        recent_limit = max(1, int(recent_limit or 10))
+        recent_stocking_activity = all_stocking_activity[:recent_limit]
+
+        largest_stocking_event = max(all_stocking_activity, key=lambda x: x["fish_stocked"], default=None)
+
+        summary = {
+            "coverage_statement": (
+                f"Total coverage based on {stocking_events} stocking events "
+                f"across {len(unique_waters)} waters."
+            ),
+            "total_fish_stocked": total_fish_stocked,
+            "stocking_events": stocking_events,
+            "unique_waters_served": len(unique_waters),
+            "unique_species_stocked": len(unique_species),
+            "average_fish_weight": _safe_round(average_weight, 2),
+            "average_fish_per_event": _safe_round(average_fish_per_event, 2),
+            "median_fish_per_event": _safe_round(float(median_fish_per_event), 2) if median_fish_per_event is not None else None,
+            "first_recorded_stocking": first_recorded_stocking,
+            "most_recent_stocking": most_recent_stocking,
+            "active_years": active_years,
+            "average_events_per_year": _safe_round(
+                stocking_events / active_years if active_years else None,
+                2,
+            ),
+            "waters_with_coordinates": len(unique_waters_with_coordinates),
+            "derby_stocking_events": derby_stocking_events,
+            "derby_waters_served": len(unique_derby_waters),
+            "largest_stocking_event": largest_stocking_event,
+        }
+
+        return {
+            "query": query,
+            "resolved_hatchery": resolved_hatchery,
+            "match_strategy": match_strategy,
+            "match_count": len(matches),
+            "matches": matches,
+            "summary": summary,
+            "top_waters": top_waters,
+            "species_breakdown": species_breakdown,
+            "yearly_totals": yearly_summary,
+            "monthly_totals": monthly_summary,
+            "recent_stocking_activity": recent_stocking_activity,
+            "all_stocking_activity": all_stocking_activity,
+            "geo_bounds": geo_bounds,
+        }
 
     def get_date_data_updated(self):
         return self.conn.execute(text("SELECT updated FROM utility ORDER BY id DESC LIMIT 1")).scalar()

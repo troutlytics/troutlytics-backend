@@ -112,6 +112,7 @@ async def index_view(request: Request):
             "/stocked_lakes_data_all_time": "Retrieve data for stocked lakes from 2000 to today",
             "/total_stocked_by_date_data": "Retrieve total number of fish stocked by date",
             "/hatchery_totals": "Retrieve hatchery totals",
+            "/hatchery_profile": "Retrieve full profile, trends, and activity for a hatchery",
             "/derby_lakes_data": "Retrieve derby lakes data",
             "/date_data_updated": "Retrieve the date when data was last updated"
         },
@@ -147,6 +148,15 @@ async def index_view(request: Request):
                     "end_date": "End date for data (optional, default: current date)"
                 },
                 "example": "/hatchery_totals?start_date=2023-01-01&end_date=2023-01-07"
+            },
+            "/hatchery_profile": {
+                "method": "GET",
+                "description": "Retrieve rich data for a matched hatchery name",
+                "params": {
+                    "name": "Hatchery name (required, case-insensitive, partial match supported)",
+                    "recent_limit": "Number of rows in recent_stocking_activity (optional, default: 10)"
+                },
+                "example": "/hatchery_profile?name=Army%20Np(American%20Lk)&recent_limit=10"
             },
             "/derby_lakes_data": {
                 "method": "GET",
@@ -238,6 +248,35 @@ async def get_hatchery_totals(request: Request):
             etag_seed=etag_seed,
             request=request,
         )
+
+
+@app.get("/hatchery_profile")
+async def get_hatchery_profile(request: Request):
+    hatchery_name = request.query_params.get("name")
+    if not hatchery_name:
+        return {"error": "Missing required query parameter: name"}
+
+    recent_limit_str = request.query_params.get("recent_limit", "10")
+    try:
+        recent_limit = int(recent_limit_str)
+    except ValueError:
+        recent_limit = 10
+    recent_limit = max(1, min(recent_limit, 100))
+
+    try:
+        profile = db.get_hatchery_profile(hatchery_name=hatchery_name, recent_limit=recent_limit)
+        last_updated = str(db.get_date_data_updated())
+        resolved = (profile or {}).get("resolved_hatchery") or hatchery_name
+        etag_seed = f"hatchery-profile:{resolved.lower()}:{recent_limit}:{last_updated}"
+        return cached_json_response(
+            profile,
+            cache_seconds=DEFAULT_CACHE_TTL_SECONDS,
+            etag_seed=etag_seed,
+            request=request,
+        )
+    except Exception as e:
+        logger.exception("Failed to build hatchery profile for %s", hatchery_name)
+        return {"error": str(e)}
 
 
 @app.get("/derby_lakes_data")
