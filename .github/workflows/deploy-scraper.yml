@@ -69,3 +69,18 @@ jobs:
           tags: |
             ${{ steps.api-image.outputs.ecr_image_uri }}
             ${{ steps.api-image.outputs.ecr_image_latest }}
+
+      - name: Update Lambda to new API image
+        env:
+          LAMBDA_FUNCTION_NAME: ${{ secrets.API_LAMBDA_FUNCTION_NAME || 'troutlytics-api' }}
+        run: |
+          aws lambda update-function-code \
+            --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --image-uri "${{ steps.api-image.outputs.ecr_image_uri }}"
+
+      - name: Wait for Lambda update to complete
+        env:
+          LAMBDA_FUNCTION_NAME: ${{ secrets.API_LAMBDA_FUNCTION_NAME || 'troutlytics-api' }}
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${LAMBDA_FUNCTION_NAME}"
