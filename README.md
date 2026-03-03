@@ -73,7 +73,7 @@ Scraper behavior flags:
 - `SCRAPER_GEOCODE` (`true/false`, default `false`)
 - `GV3_API_KEY` (required only when geocoding is enabled)
 
-## Local Development
+## Local Development (2 options)
 
 ### Option 1: Docker Compose
 
