@@ -136,6 +136,11 @@ class Scraper:
         "https://wdfw.wa.gov/fishing/reports/stocking/trout-plants/all"
         "?lake_stocked=&county=&species=&hatchery=&region=&items_per_page=250"
     )
+    DEFAULT_BROWSER_USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0.0.0 Safari/537.36"
+    )
 
     def __init__(self, db: Optional[DataBase] = None):
         self.db = db
@@ -152,10 +157,32 @@ class Scraper:
         self.by_clean_relaxed: Dict[str, WaterLocation] = {}
         self.by_clean_alnum: Dict[str, WaterLocation] = {}
 
-    @staticmethod
-    def _session() -> requests.Session:
+    @classmethod
+    def _browser_headers(cls) -> Dict[str, str]:
+        return {
+            "User-Agent": cls.DEFAULT_BROWSER_USER_AGENT,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    @classmethod
+    def _request_headers(cls) -> Dict[str, str]:
+        headers = cls._browser_headers()
+        configured_user_agent = os.getenv("SCRAPER_USER_AGENT")
+        if configured_user_agent:
+            headers["User-Agent"] = configured_user_agent
+        return headers
+
+    @classmethod
+    def _session(cls) -> requests.Session:
         s = requests.Session()
-        s.headers["User-Agent"] = "TroutlyticsScraper/1.0 (+contact: troutlytics)"
+        s.headers.update(cls._request_headers())
         retries = Retry(
             total=3,
             backoff_factor=0.5,
@@ -209,6 +236,14 @@ class Scraper:
     def fetch(self, url: str) -> BeautifulSoup:
         logging.info("Fetching %s", url)
         r = self.session.get(url, timeout=20)
+        if r.status_code == 403:
+            fallback_headers = self._browser_headers()
+            if any(self.session.headers.get(k) != v for k, v in fallback_headers.items()):
+                logging.warning(
+                    "Received 403 from %s; retrying once with browser-style headers",
+                    url,
+                )
+                r = self.session.get(url, timeout=20, headers=fallback_headers)
         r.raise_for_status()
         return BeautifulSoup(r.content, "html.parser")
 
